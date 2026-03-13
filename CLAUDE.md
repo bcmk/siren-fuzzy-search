@@ -1,0 +1,17 @@
+# Claude Code Guidelines
+
+## Git
+
+- Don't use heredocs for commit messages, use `git commit -m "message"`
+
+## Code Style
+
+- Use lowercase SQL keywords in code blocks,
+  uppercase in prose (e.g. `SELECT`, `LIKE`, `SET LOCAL`)
+
+## Checks
+
+- Run `mypy` after changes
+- Run `ruff check --fix` after changes
+- Run `ruff format` after changes
+- Run `scripts/genpdf` after changing `docs/search.md`

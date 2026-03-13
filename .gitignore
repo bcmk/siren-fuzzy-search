@@ -1,0 +1,7 @@
+?*.ignore
+?*.ignore.?*
+.DS_Store
+config.ini
+.venv/
+__pycache__/
+*.pdf

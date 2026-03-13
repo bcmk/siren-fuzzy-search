@@ -1,0 +1,8 @@
+#!/bin/sh
+pandoc docs/search.md -o docs/search.pdf \
+    --pdf-engine=xelatex \
+    -V geometry:margin=1in \
+    -V colorlinks=true \
+    -V linkcolor=blue \
+    -V mainfont="Helvetica Neue" \
+    -V monofont="Menlo"
