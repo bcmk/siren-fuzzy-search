@@ -193,7 +193,7 @@ limit 100;
 ```
 
 `'lemberg\_caviar'` is the search term with `LIKE` metacharacters escaped:
-`_` -> `\_`, `%` -> `\%`, `\` -> `\\`.
+`_` ⟶ `\_`, `%` ⟶ `\%`, `\` ⟶ `\\`.
 
 This is the workhorse leg.
 `pg_trgm` uses the search term's trigrams
@@ -273,7 +273,8 @@ set local enable_bitmapscan = on;
 insert into _search_results
 select nickname from people
 where max_repeated_alnum_run(nickname)
-    >= max_repeated_alnum_run('lemberg_caviar') -- precompute during analysis in prod
+    -- precompute during analysis in prod
+    >= max_repeated_alnum_run('lemberg_caviar')
   and nickname like '%lemberg\_caviar%' -- LIKE-escaped search term
 limit 100;
 ```
@@ -320,7 +321,8 @@ set local enable_bitmapscan = off;
 insert into _search_results
 select nickname from people
 where max_nonalnum_run(nickname)
-    >= max_nonalnum_run('lemberg_caviar') -- precompute during analysis in prod
+    -- precompute during analysis in prod
+    >= max_nonalnum_run('lemberg_caviar')
   and nickname like '%lemberg\_caviar%' -- LIKE-escaped search term
 limit 100;
 ```
@@ -484,28 +486,28 @@ We benchmarked 178 search terms on a 3.3-million-row table
 on a DigitalOcean managed database (1 vCPU, 1 GB RAM).
 Here are 20 randomly selected results:
 
-| Search term                           | ms  |
-| ------------------------------------- | --- |
-| `"______________________________"`    | 3   |
-| `"__a__b__"`                          | 40  |
-| `"a________________________________"` | 2   |
-| `"b___"`                              | 5   |
-| `"ee"`                                | 5   |
-| `"emma"`                              | 30  |
-| `"ethan"`                             | 21  |
-| `"finn"`                              | 12  |
-| `"lily_grace_park_nash"`              | 89  |
-| `"mason"`                             | 29  |
-| `"max"`                               | 5   |
-| `"mia_lynn_jones_hall"`               | 88  |
-| `"noah_james_kim"`                    | 72  |
-| `"nora"`                              | 16  |
-| `"owen"`                              | 8   |
-| `"owen_rose_park_cruz"`               | 47  |
-| `"qjonpbvhpysdhr"`                    | 3   |
-| `"ryan_lynn_bell"`                    | 38  |
-| `"xyz"`                               | 3   |
-| `"zoe"`                               | 4   |
+| Search term                         | ms  |
+| ----------------------------------- | --- |
+| `______________________________`    | 3   |
+| `__a__b__`                          | 40  |
+| `a________________________________` | 2   |
+| `b___`                              | 5   |
+| `ee`                                | 5   |
+| `emma`                              | 30  |
+| `ethan`                             | 21  |
+| `finn`                              | 12  |
+| `lily_grace_park_nash`              | 89  |
+| `mason`                             | 29  |
+| `max`                               | 5   |
+| `mia_lynn_jones_hall`               | 88  |
+| `noah_james_kim`                    | 72  |
+| `nora`                              | 16  |
+| `owen`                              | 8   |
+| `owen_rose_park_cruz`               | 47  |
+| `qjonpbvhpysdhr`                    | 3   |
+| `ryan_lynn_bell`                    | 38  |
+| `xyz`                               | 3   |
+| `zoe`                               | 4   |
 
 Over all 178 search terms: median = 31 ms, 90th percentile = 51 ms, maximum = 131 ms.
 

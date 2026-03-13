@@ -1,0 +1,4 @@
+#!/bin/sh
+pandoc docs/search.md -o docs/search.html \
+    --standalone \
+    --metadata title="Fast Fuzzy Search on Millions of Rows in PostgreSQL"
