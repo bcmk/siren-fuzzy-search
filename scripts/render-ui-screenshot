@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+
+import subprocess
+
+from PIL import Image, ImageDraw, ImageFont
+
+text = """\
+┌───────────────────────────────────┬───────────────────────┐
+│> mrs_robinson                     │ exact match     16 ms │
+│                                   │ substring       33 ms │
+│                                   │ similarity     117 ms │
+│                total time: 178 ms │ sort            12 ms │
+├───────────────────────────────────┴───────────────────────┤
+│  mrs_robinson86                                           │
+│  mrs_robinson359                                          │
+│  mia_robinson_                                            │
+│  mila_robinson                                            │
+│  don_robinson                                             │
+└───────────────────────────────────────────────────────────┘"""
+
+font_path = subprocess.check_output(
+    ["fc-match", "--format=%{file}", "JetBrains Mono"], text=True
+)
+font_size = 20
+font = ImageFont.truetype(font_path, font_size)
+
+pad = 24
+bg = (30, 30, 46)
+fg = (205, 214, 244)
+
+bbox = font.getbbox("M")
+char_w = bbox[2] - bbox[0]
+char_h = int(font_size * 1.45)
+
+lines = text.split("\n")
+max_cols = max(len(l) for l in lines)
+img_w = max_cols * char_w + pad * 2
+img_h = len(lines) * char_h + pad * 2
+
+img = Image.new("RGB", (img_w, img_h), bg)
+draw = ImageDraw.Draw(img)
+
+for row, line in enumerate(lines):
+    y = pad + row * char_h
+    draw.text((pad, y), line, font=font, fill=fg)
+
+img.save("docs/ui-screenshot.png")
