@@ -6,6 +6,8 @@ with a few million rows,
 some edge cases turned out to be glacially slow.
 Let's build one that stays fast regardless of input.
 
+![Search testing tool](docs/ui-screenshot.png)
+
 ## Problem
 
 Let's say we have a table `people` with ~3 million rows
@@ -85,7 +87,8 @@ The search term `"aaaaaa"` produces a single useful trigram `"aaa"` —
 `pg_trgm` does not count trigram occurrences,
 it only checks presence.
 GIN only narrows results to rows containing `"aaa"` —
-most of which don't actually contain `"aaaaaa"`.
+most of which don't actually contain `"aaaaaa"`,
+making the search painfully slow.
 
 **Non-alphanumeric characters** are invisible to `pg_trgm`.
 `show_trgm('_____')` returns an empty array.
