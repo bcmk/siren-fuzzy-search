@@ -326,7 +326,7 @@ def redraw(
     prompt = "> " + query
     scr.addstr(0, 0, prompt)
     if timings:
-        leg_str = " ".join(f"{name}:{t:.0f}" for name, t in timings)
+        leg_str = " ".join(f"{name}:{t:.0f}ms" for name, t in timings)
         scr.addstr(0, len(prompt), f"  {leg_str}", curses.A_DIM)
     for i, r in enumerate(res[:MAX_RESULTS]):
         scr.addstr(i + 1, 2, r)
