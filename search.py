@@ -8,7 +8,6 @@ import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any
 
 import configargparse
 import psycopg
@@ -125,7 +124,7 @@ def search(
         cur = conn.cursor()
 
         # Exact match guarantees the exact needle appears in results first, even if other legs miss it
-        with leg_pipeline("exact"):
+        with leg_pipeline("exact match"):
             cur.execute(
                 psycopg.sql.SQL(
                     """
@@ -150,7 +149,7 @@ def search(
         #               so bitmap includes every row with the "aaa" trigram, but most don't contain "aaaaaa";
         #               we fall back to repeated-alnum-runs leg instead)
         if max_alnum_run >= 3 and max_repeated_alnum_run < 5:
-            with leg_pipeline("sub"):
+            with leg_pipeline("substring"):
                 cur.execute("set local enable_seqscan = off")
                 cur.execute("set local enable_indexscan = off")
                 cur.execute("set local enable_indexonlyscan = off")
@@ -177,7 +176,7 @@ def search(
         #     "ab" (non-selective similarity; we fall back to prefix leg instead)
         #     "___" (GIN ignores non-alphanumeric characters; we fall back to prefix leg instead)
         if alnum_count >= 2 and len(query) >= 4:
-            with leg_pipeline("sim"):
+            with leg_pipeline("similarity"):
                 cur.execute("set local enable_seqscan = off")
                 cur.execute("set local enable_indexscan = off")
                 cur.execute("set local enable_indexonlyscan = off")
@@ -205,7 +204,7 @@ def search(
         #     "aaaa" (this index would return too many runs of 4 symbols; we fall back to GIN substring leg instead)
         #     "_____" (nonalnum chars have no trigrams, so no BitmapAnd; nonalnum-runs leg has its own smaller index)
         if max_repeated_alnum_run >= 5:
-            with leg_pipeline("alnum"):
+            with leg_pipeline("alnum runs"):
                 cur.execute("set local enable_seqscan = off")
                 cur.execute("set local enable_indexscan = off")
                 cur.execute("set local enable_indexonlyscan = off")
@@ -230,7 +229,7 @@ def search(
         # We don't use this leg for:
         #     "__" (too many rows with 2+ consecutive nonalnum chars; we fall back to prefix leg instead)
         if max_nonalnum_run >= 3:
-            with leg_pipeline("noalnum"):
+            with leg_pipeline("nonalnum runs"):
                 cur.execute("set local enable_seqscan = off")
                 cur.execute("set local enable_indexscan = off")
                 cur.execute("set local enable_indexonlyscan = on")
@@ -255,7 +254,7 @@ def search(
         #     "abc" (GIN substring leg handles it instantly)
         #     "___" (nonalnum-runs leg handles it)
         if max_alnum_run < 3 and max_nonalnum_run < 3:
-            with leg_pipeline("prefix"):
+            with leg_pipeline("prefix match"):
                 cur.execute("set local enable_seqscan = off")
                 cur.execute("set local enable_indexscan = off")
                 cur.execute("set local enable_bitmapscan = off")
@@ -291,19 +290,11 @@ def search(
     return results, timings
 
 
-def keystroke_daemon(
-    stdscr: curses.window,
-    events: queue.Queue[tuple[str, Any]],
-) -> None:
-    while True:
-        events.put(("key", stdscr.get_wch()))
-
-
 def search_daemon(
     conn: psycopg.Connection,
     cfg: argparse.Namespace,
     search_q: queue.Queue[str],
-    events: queue.Queue[tuple[str, Any]],
+    results_q: queue.Queue[tuple[list[str], list[tuple[str, float]]]],
 ) -> None:
     while True:
         query = search_q.get()
@@ -312,26 +303,65 @@ def search_daemon(
         time.sleep(cfg.debounce_ms / 1000)
         if not search_q.empty():
             continue
-        results, timings = search(conn, cfg, query)
-        events.put(("results", (results, timings)))
+        results_q.put(search(conn, cfg, query))
+
+
+DIVIDER_COL = 36
 
 
 def redraw(
-    scr: curses.window,
+    stdscr: curses.window,
+    win: curses.window,
     query: str,
     res: list[str],
     timings: list[tuple[str, float]],
 ) -> None:
-    scr.erase()
+    leg_count = sum(1 for name, _ in timings if name != "total")
+    timing_rows = max(leg_count, 1)
+    _, cols = win.getmaxyx()
+    win.resize(MAX_RESULTS + timing_rows + 3, cols)
+    win.erase()
+    stdscr.erase()
+    stdscr.noutrefresh()
+    h_divider = timing_rows + 1
+
+    win.box()
+
+    # Vertical divider in top section
+    win.addch(0, DIVIDER_COL, curses.ACS_TTEE)
+    for row in range(1, h_divider):
+        win.addch(row, DIVIDER_COL, curses.ACS_VLINE)
+
+    # Horizontal divider before results
+    win.addch(h_divider, 0, curses.ACS_LTEE)
+    win.hline(h_divider, 1, curses.ACS_HLINE, cols - 2)
+    win.addch(h_divider, DIVIDER_COL, curses.ACS_BTEE)
+    win.addch(h_divider, cols - 1, curses.ACS_RTEE)
+
     prompt = "> " + query
-    scr.addstr(0, 0, prompt)
-    if timings:
-        leg_str = " ".join(f"{name}:{t:.0f}ms" for name, t in timings)
-        scr.addstr(0, len(prompt), f"  {leg_str}", curses.A_DIM)
+    win.addstr(1, 1, prompt)
+
+    leg_timings = [x for x in timings if x[0] != "total"]
+    total_timing = next((t for name, t in timings if name == "total"), None)
+
+    for i, (name, t) in enumerate(leg_timings):
+        win.addstr(
+            1 + i,
+            DIVIDER_COL + 2,
+            f"{name:<14}{t:>4.0f} ms",
+            curses.A_DIM,
+        )
+
+    if total_timing is not None:
+        total_str = f"total time: {total_timing:.0f} ms"
+        win.addstr(h_divider - 1, DIVIDER_COL - 1 - len(total_str), total_str, curses.A_DIM)
+
     for i, r in enumerate(res[:MAX_RESULTS]):
-        scr.addstr(i + 1, 2, r)
-    scr.move(0, len(prompt))
-    scr.refresh()
+        win.addstr(h_divider + 1 + i, 3, r)
+
+    win.move(1, 1 + len(prompt))
+    win.noutrefresh()
+    curses.doupdate()
 
 
 def interactive(
@@ -341,15 +371,17 @@ def interactive(
 ) -> None:
     curses.use_default_colors()
     curses.curs_set(1)
-    stdscr.keypad(True)
 
-    events: queue.Queue[tuple[str, Any]] = queue.Queue()
+    win = curses.newwin(MAX_RESULTS + 4, 61, 0, 0)
+    win.keypad(True)
+    win.timeout(50)
+
     search_q: queue.Queue[str] = queue.Queue()
+    results_q: queue.Queue[tuple[list[str], list[tuple[str, float]]]] = queue.Queue()
 
-    threading.Thread(target=keystroke_daemon, args=(stdscr, events), daemon=True).start()
     threading.Thread(
         target=search_daemon,
-        args=(conn, cfg, search_q, events),
+        args=(conn, cfg, search_q, results_q),
         daemon=True,
     ).start()
 
@@ -357,31 +389,25 @@ def interactive(
         query = ""
         results: list[str] = []
         timings: list[tuple[str, float]] = []
-        redraw(stdscr, query, results, timings)
+        redraw(stdscr, win, query, results, timings)
         while True:
+            while not results_q.empty():
+                results, timings = results_q.get_nowait()
+                redraw(stdscr, win, query, results, timings)
             try:
-                kind, value = events.get()
-            except KeyboardInterrupt:
-                break
-            if kind == "results":
-                results, timings = value
-                redraw(stdscr, query, results, timings)
+                key = win.get_wch()
+            except curses.error:
                 continue
-            if kind == "key":
-                if value == "\x1b":
-                    break
-                elif value in ("\x7f", "\b", curses.KEY_BACKSPACE):
-                    query = query[:-1]
-                elif (
-                    isinstance(value, str)
-                    and (value.isascii() and value.isalnum() or value in "_-@")
-                    and len(query) < 32
-                ):
-                    query += value.lower()
-                else:
-                    continue
-                search_q.put(query)
-                redraw(stdscr, query, results, timings)
+            if key == "\x1b":
+                break
+            elif key in ("\x7f", "\b", curses.KEY_BACKSPACE):
+                query = query[:-1]
+            elif isinstance(key, str) and (key.isascii() and key.isalnum() or key in "_-@") and len(query) < 32:
+                query += key.lower()
+            else:
+                continue
+            search_q.put(query)
+            redraw(stdscr, win, query, results, timings)
     finally:
         conn.close()
 
