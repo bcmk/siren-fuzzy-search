@@ -4,5 +4,6 @@ pandoc docs/search.md -o docs/search.pdf \
     -V geometry:margin=1in \
     -V colorlinks=true \
     -V linkcolor=blue \
-    -V mainfont="Helvetica Neue" \
-    -V monofont="Menlo"
+    -V mainfont="Inter" \
+    -V monofont="JetBrains Mono" \
+    -V 'monofontoptions=RawFeature=-calt'
