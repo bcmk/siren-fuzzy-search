@@ -6,7 +6,7 @@ with a few million rows,
 some edge cases turned out to be glacially slow.
 Let's build one that stays fast regardless of input.
 
-![Search testing tool](docs/ui-screenshot.png)
+![Search testing tool](ui-screenshot.png)
 
 ## Problem
 

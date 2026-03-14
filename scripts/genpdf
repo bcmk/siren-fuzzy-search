@@ -1,5 +1,6 @@
 #!/bin/sh
 pandoc docs/search.md -o docs/search.pdf \
+    --resource-path=docs \
     --pdf-engine=xelatex \
     -V geometry:margin=1in \
     -V colorlinks=true \
