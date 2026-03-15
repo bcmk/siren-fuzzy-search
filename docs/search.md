@@ -536,6 +536,21 @@ run the right leg for each class,
 and let the union plus trigram sorting
 produce a cohesive result.
 
+## Testing Tool
+
+The [companion repository](https://github.com/bcmk/siren-fuzzy-search)
+includes an interactive terminal tool
+for testing search against a live database.
+It connects to PostgreSQL directly,
+runs all the legs described above,
+and shows results with per-leg timings
+as you type.
+
+The tool helped catch slow edge cases early —
+you can try any input pattern
+and immediately see which legs fire
+and how long each one takes.
+
 ## Where We Use This
 
 This technique powers the streamer search
