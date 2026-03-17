@@ -1,1 +1,1 @@
-Fast fuzzy search with trigrams over millions of PostgreSQL rows. Covers GiST and GIN limitations and a multi-leg search strategy.
+Fast fuzzy search with trigrams over millions of nicknames in PostgreSQL. Covers GiST and GIN limitations and a multi-leg search strategy.

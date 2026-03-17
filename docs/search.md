@@ -1,4 +1,4 @@
-# Fast Fuzzy Search on Millions of Rows in PostgreSQL
+# Fast Fuzzy Search on Millions of Nicknames in PostgreSQL
 
 There are plenty of articles about fuzzy search in PostgreSQL.
 However, when I tried these approaches on a table
