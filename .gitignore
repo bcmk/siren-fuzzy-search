@@ -6,3 +6,4 @@ config.ini
 __pycache__/
 *.pdf
 *.html
+**/.claude/settings.local.json
