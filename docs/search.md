@@ -416,11 +416,11 @@ Here is a summary of the activation rules:
 | Leg                 | Purpose                     | Run when                                   |
 | ------------------- | --------------------------- | ------------------------------------------ |
 | Exact match         | Include exact hit           | Always                                     |
-| Main substring      | Main substring filter       | max alnum run ≥ 3 and max repeated run < 5 |
-| Main fuzzy          | Fuzzy/typo matching         | alnum count ≥ 2 and length ≥ 4             |
-| Repeated-run rescue | Handle inputs like `aaaaaa` | max repeated run ≥ 5                       |
-| Non-alnum rescue    | Handle inputs like `___`    | max non-alnum run ≥ 3                      |
-| Prefix fallback     | Low-information fallback    | no stronger content-based leg qualifies    |
+| Main substring      | Main substring filter       | Max alnum run ≥ 3 and max repeated run < 5 |
+| Main fuzzy          | Fuzzy/typo matching         | Alnum count ≥ 2 and length ≥ 4             |
+| Repeated-run rescue | Handle inputs like `aaaaaa` | Max repeated run ≥ 5                       |
+| Non-alnum rescue    | Handle inputs like `___`    | Max non-alnum run ≥ 3                      |
+| Prefix fallback     | Low-information fallback    | No stronger content-based leg qualifies    |
 
 ## Planner Control
 
