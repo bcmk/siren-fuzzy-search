@@ -214,7 +214,7 @@ which are then rechecked against the `LIKE` predicate.
 create index on people using gin (nickname gin_trgm_ops);
 ```
 
-### 3. Main Fuzzy Leg
+### 3. Main Fuzzy Leg (word similarity)
 
 ```sql
 -- force GIN bitmap scan (planner sometimes prefers a slower btree scan)
