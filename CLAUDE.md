@@ -14,4 +14,5 @@
 - Run `mypy` after changes
 - Run `ruff check --fix` after changes
 - Run `ruff format` after changes
+- Run `prettier --write` on markdown files after changes
 - Run `scripts/genpdf` after changing `docs/search.md`

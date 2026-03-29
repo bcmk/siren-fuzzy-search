@@ -1,18 +1,17 @@
 # Fast Fuzzy Search on Millions of Nicknames in PostgreSQL
 
 There are plenty of articles about fuzzy search in PostgreSQL.
-However, when I tried these approaches on a table
-with a few million rows,
-some edge cases turned out to be glacially slow.
-Let's build one that stays fast regardless of input.
+However, when I tried these approaches on a table with a few million rows,
+some search terms turned out to be hundreds of times slower than others.
+So let's build fuzzy search that stays fast regardless of inputs.
 
 ![Search testing tool](ui-screenshot.png)
 
 ## Problem
 
-Let's say we have a table `people` with ~3 million rows
-and a `nickname` field consisting of lowercase `a-z`, `0-9`, and `_`.
-We want to implement fuzzy search over it.
+Let's say we have a table `people` with ~3 million rows.
+Each row has a `nickname` field consisting of lowercase `a-z`, `0-9`, and `_`.
+We want to fuzzy search these nicknames.
 
 Soundex and full-text search are usually a poor fit here —
 nicknames are not natural language words.
@@ -22,7 +21,8 @@ nicknames are not natural language words.
 The most natural and precise approach is described
 in PostgreSQL's `pg_trgm` extension
 [documentation](https://www.postgresql.org/docs/current/pgtrgm.html).
-The extension provides trigram-based similarity and indexing:
+The extension provides trigram-based similarity.
+So why don't we just sort by similarity and print out the best matches?
 
 ```sql
 create extension if not exists pg_trgm;
@@ -35,65 +35,63 @@ order by dist
 limit 10;
 ```
 
-This uses a GiST index (GIN cannot accelerate the `<->` distance operator)
-to find the closest matches by trigram distance.
+This uses a GiST index to find the closest matches by trigram distance.
+GIN, the other option provided by this extension,
+cannot accelerate the `<->` (trigram distance) operator.
 
-In my testing on a DigitalOcean managed database
-(1 vCPU, 1 GB RAM)
-it became unusable at around 1 million rows.
-Latency sometimes went up to 800 ms (90th percentile),
+In my testing on a DigitalOcean managed database (1 vCPU, 1 GB RAM)
+it worked well until it became unusable at around 1 million rows.
+Meanwhile latency sometimes went up to 800 ms (90th percentile),
 outliers could reach 5 seconds.
 
 GiST is a tree index.
-Each leaf stores a lossy signature (a fixed-size bitfield)
-of a row's trigrams.
+Each leaf stores a lossy signature (a fixed-size bitfield) of a row's trigrams.
 Each trigram hashes to a bit position in the signature,
 but different trigrams can collide —
-hypothetically, `"aaa"`, `"bbb"`, and `"ccc"`
-might all set bit 5.
+hypothetically, `"aaa"`, `"bbb"`, and `"ccc"` might all set bit 5.
 
-Internal tree nodes store the bitwise OR
-of all their children's signatures.
-This lets the index explore only subtrees
-where the trigram bit is present.
+Internal tree nodes store the bitwise OR of all their children's signatures.
+This lets the index explore only subtrees where the trigram bit is present.
+
+GiST signature length can be tuned with `siglen`,
+which can reduce false positives at the cost of a larger index,
+but in our tests it did not close the gap enough on multi-million-row tables.
 
 ## The Next Option: GIN
 
 The other index type `pg_trgm` offers is GIN.
-GIN maps each trigram
-to the rows that contain it.
+GIN maps each trigram to the rows that contain it.
 For example, to find the `"lemberg_caviar"` substring
 (`LIKE '%lemberg\_caviar%'` predicate),
 GIN looks up the rows for each trigram
-(`"  l"`, `" le"`, `"lem"`, `"emb"`, `"mbe"`,
-`"ber"`, `"erg"`, `"rg "`, `"  c"`, `" ca"`,
-`"cav"`, `"avi"`, `"via"`, `"iar"`, `"ar "`)
-and intersects them.
+(`"  l"`, `" le"`, `"lem"`, `"emb"`, `"mbe"`, `"ber"`, `"erg"`, `"rg "`,
+`"  c"`, `" ca"`, `"cav"`, `"avi"`, `"via"`, `"iar"`, `"ar "`)
+and returns only rows where all of them are present.
 This scales much better than GiST on large tables.
 But it has its own blind spots.
 
 ## When GIN Trigrams Break Down
 
-**Short search terms** produce space-padded trigrams
+**Short search terms**, e.g., `"ab"`, produce space-padded trigrams
 like `"  a"` and `" ab"` that match a huge fraction of the table.
 A GIN trigram index on 3.3 million rows
 returns 1.7 million candidate rows for `"ab"` —
-GIN must build the entire bitmap before returning rows,
+worse yet, GIN must build the entire bitmap before returning any row,
 which takes up to 8 seconds in my tests.
 
 **Repeated characters** cause too many false positives.
 For example, let's work through a condition `LIKE '%aaaaaa%'`.
 The search term `"aaaaaa"` produces a single useful trigram `"aaa"` —
-`pg_trgm` does not count trigram occurrences,
-it only checks presence.
-GIN only narrows results to rows containing `"aaa"` —
-most of which don't actually contain `"aaaaaa"`,
-making the search painfully slow.
+`pg_trgm` does not count how many times a trigram occurs,
+it only checks its presence.
+So GIN only narrows results to rows containing `"aaa"` —
+most of which don't actually contain `"aaaaaa"`.
+This makes the search painfully slow.
 
 **Non-alphanumeric characters** are invisible to `pg_trgm`.
 `show_trgm('_____')` returns an empty array.
 A username made of underscores
-cannot be narrowed by any trigram index.
+cannot be narrowed by any PostgreSQL trigram index.
 
 No single index or operator covers all of these cases.
 The key insight is: don't try to find one.
@@ -104,10 +102,11 @@ GIN works well for most queries
 but each edge case above needs its own index and query.
 Instead of handling all inputs with one query,
 let's split the search into multiple legs
-and pick the ones that are fast
-for the specific search term at hand.
-Then deduplicate and sort
-by trigram distance.
+and pick the ones that are fast for the specific search term at hand.
+We decide which legs to run on the application side,
+then deduplicate their results and sort by trigram distance.
+We use a temp table rather than `UNION ALL` CTEs
+because each leg needs its own `SET LOCAL` planner overrides.
 
 ```sql
 begin;
@@ -146,10 +145,9 @@ In practice, we analyse the search term first
 and only enable the legs that are fast
 for the given search term — more on this below.
 
-Ideally each leg would return the closest matches
-by trigram distance,
+Ideally each leg would return the closest matches by trigram distance,
 but such ordering is too expensive on large tables.
-So each "fuzzy" leg collects a random `LIMIT 100` —
+So each "fuzzy" leg collects `LIMIT 100` in arbitrary order —
 which turns out to be good enough in practice —
 and the final sort ranks only those candidates.
 
@@ -158,7 +156,7 @@ cleans itself up when the transaction ends.
 
 ## The Legs
 
-### 1. Exact Match
+### 1. Exact Match Leg
 
 ```sql
 create temp table _search_results on commit drop as
@@ -168,19 +166,19 @@ where nickname = 'lemberg_caviar'; -- search term
 
 Uses a B-tree index to check
 if the search term matches an existing record exactly.
-This is cheap and ensures an exact match is included
-if one exists.
+This is cheap and ensures an exact match is included if one exists.
 
 **Activate when:** always.
 
-**Prerequisites:** a B-tree index with `text_pattern_ops`,
-which also supports `=`.
+**Prerequisites:** a B-tree index with `text_pattern_ops`, which also supports `=`.
+Actually you can use a plain B-tree index (without `text_pattern_ops`);
+more on this in leg 6.
 
 ```sql
 create index on people (nickname text_pattern_ops);
 ```
 
-### 2. Substring (accelerated by GIN trigram index)
+### 2. Main Substring Leg (accelerated by GIN trigram index)
 
 ```sql
 -- force GIN bitmap scan (planner sometimes prefers a slower btree scan)
@@ -199,8 +197,7 @@ limit 100;
 `_` ⟶ `\_`, `%` ⟶ `\%`, `\` ⟶ `\\`.
 
 This is the workhorse leg.
-`pg_trgm` uses the search term's trigrams
-to produce candidate rows,
+`pg_trgm` uses the search term's trigrams to produce candidate rows,
 which are then rechecked against the `LIKE` predicate.
 
 **Activate when:**
@@ -217,7 +214,7 @@ which are then rechecked against the `LIKE` predicate.
 create index on people using gin (nickname gin_trgm_ops);
 ```
 
-### 3. Word Similarity
+### 3. Main Fuzzy Leg
 
 ```sql
 -- force GIN bitmap scan (planner sometimes prefers a slower btree scan)
@@ -235,12 +232,14 @@ limit 100;
 
 This is where all the fuzziness comes from.
 The `%>` operator (word similarity) slides the search term
-across every position in the target string
-and takes the best similarity score.
-It catches typos, transpositions,
-and partial matches that `LIKE` would miss.
+across every position in the target string and takes the best similarity score.
+It catches typos, transpositions, and partial matches that `LIKE` would miss.
+Despite the name, word similarity in `pg_trgm` is still trigram-based;
+it does not depend on dictionaries or linguistic tokenization.
+For nicknames, its usefulness comes from allowing
+a good substring-level match inside a longer value.
 
-Raise the threshold from the default 0.3 to 0.5
+We raise the threshold from the default 0.3 to 0.5
 to avoid flooding the result set with poor matches.
 
 **Activate when:**
@@ -251,19 +250,16 @@ to avoid flooding the result set with poor matches.
 **Prerequisites:** the same GIN trigram index as leg 2.
 
 **Why `%>` and not `%`:**
-the `%` operator computes similarity
-over the entire strings.
+the `%` operator computes similarity over the entire strings.
 A short search term like `"kate"` has low whole-string similarity
 against a longer value like `"katesmithxyz"`,
 so most GIN candidates fail the recheck.
 In practice, `%` has to scan thousands of heap blocks
 (GIN does not support `INCLUDE` as of PostgreSQL 18)
-to find 100 matches,
-while `%>` finds them almost immediately
-because substring-level matching
-is much more generous.
+to find 100 matches, while `%>` finds them almost immediately
+because substring-level matching is much more generous.
 
-### 4. Substring (accelerated by longest repeated character index and GIN)
+### 4. Repeated-Run Rescue Leg (accelerated by longest repeated character index and GIN)
 
 ```sql
 -- force bitmap scan for BitmapAnd
@@ -291,8 +287,7 @@ helps narrow the search (via BitmapAnd).
 **Activate when:** the longest repeated-character run
 in the search term is at least 5.
 
-**Prerequisites:** a custom SQL function
-and a partial index.
+**Prerequisites:** a custom SQL function and a partial index.
 
 ```sql
 create function max_repeated_alnum_run(text)
@@ -310,7 +305,7 @@ The regex assumes lowercase ASCII nicknames (`[a-z0-9]`),
 matching the alphabet defined in the Problem section.
 The partial index is quite small.
 
-### 5. Substring (accelerated by longest non-alnum run index)
+### 5. Non-Alnum Rescue Leg (accelerated by longest non-alnum run index)
 
 ```sql
 -- force index-only scan on the max_nonalnum_run index;
@@ -354,10 +349,9 @@ create index on people (
 where max_nonalnum_run(nickname) >= 3;
 ```
 
-The partial index is quite small
-and `INCLUDE` enables index-only scans.
+The partial index is quite small and `INCLUDE` enables index-only scans.
 
-### 6. Prefix via `text_pattern_ops`
+### 6. Prefix Fallback Leg
 
 ```sql
 -- force index-only scan on text_pattern_ops btree
@@ -372,12 +366,10 @@ where nickname like 'lemberg\_caviar%' -- LIKE-escaped search term
 limit 100;
 ```
 
-This is a useful fallback for very short
-or low-information inputs.
-Prefix matching is fast but only finds nicknames
-starting with the search term.
+This is a useful fallback for very short or low-information inputs.
+Prefix matching is fast but only finds nicknames starting with the search term.
 It still provides useful results for short queries
-where substring or similarity would match almost random strings.
+where substring or similarity would match almost arbitrary strings.
 
 **Activate when:** no other content-based leg qualifies:
 
@@ -385,17 +377,25 @@ where substring or similarity would match almost random strings.
 - longest non-alphanumeric run in the search term below 3
 
 **Prerequisites:** the same `text_pattern_ops` B-tree index as leg 1.
+Actually you can use a plain B-tree index (without `text_pattern_ops`),
+if you use `collate "C"`, which is justified in our case —
+nicknames are always Latin.
+
+Note that `collate "C"` uses raw byte ordering, so comparisons become
+case-sensitive and locale-unaware — `'Z' < 'a'` and accented characters
+sort by their byte values rather than linguistic rules.
 A regular B-tree index can only accelerate `LIKE` prefix queries
-under the C collation,
-but most databases use a locale-aware collation
-like `en_US.UTF-8` instead.
+under the C collation.
+Most databases use a locale-aware collation like `en_US.UTF-8`,
+so you would need to specify `collate "C"` yourself.
 `text_pattern_ops` uses byte-wise comparison,
 so prefix `LIKE` works regardless of collation.
 
 ## Which Legs to Run
 
-Let's analyse the search term on the application side
-to decide which legs to activate:
+To make decisions on which legs to run
+according to **Activate when** conditions you see above,
+let's analyse the search term on the application side:
 
 | Metric            | What it measures                                 |
 | ----------------- | ------------------------------------------------ |
@@ -404,22 +404,29 @@ to decide which legs to activate:
 | Max repeated run  | Longest run of the _same_ alphanumeric character |
 | Max non-alnum run | Longest consecutive non-alphanumeric substring   |
 
-These four numbers determine
-which legs will produce useful results
-and which would thrash the index.
-A search term like `"aaaaaa"` has a max repeated run of 6 —
-it should skip the GIN substring leg
-and use a specialised index instead.
+These four numbers determine which legs will produce useful results
+in a reasonable time and which would thrash and slow down the index.
+For example, a search term like `"aaaaaa"` has a max repeated run of 6 —
+it should skip the GIN substring leg and use a specialised index instead.
 A search term like `"___"` has a max non-alphanumeric run of 3
-and zero alphanumeric characters —
-trigram indexes are useless here.
+and zero alphanumeric characters — trigram indexes are useless here.
+
+Here is a summary of the activation rules:
+
+| Leg                 | Purpose                     | Run when                                   |
+| ------------------- | --------------------------- | ------------------------------------------ |
+| Exact match         | Include exact hit           | Always                                     |
+| Main substring      | Main substring filter       | max alnum run ≥ 3 and max repeated run < 5 |
+| Main fuzzy          | Fuzzy/typo matching         | alnum count ≥ 2 and length ≥ 4             |
+| Repeated-run rescue | Handle inputs like `aaaaaa` | max repeated run ≥ 5                       |
+| Non-alnum rescue    | Handle inputs like `___`    | max non-alnum run ≥ 3                      |
+| Prefix fallback     | Low-information fallback    | no stronger content-based leg qualifies    |
 
 ## Planner Control
 
 PostgreSQL's query planner picks indexes automatically,
 but the wrong choice can be two orders of magnitude slower.
-Since we validated each leg
-with `EXPLAIN ANALYZE` and benchmarking,
+Since we validated each leg with `EXPLAIN ANALYZE` and benchmarking,
 we know exactly which index to use and force it
 with `SET LOCAL` before each leg:
 
@@ -431,27 +438,26 @@ set local enable_bitmapscan = on;
 -- now the planner must use bitmap scan (GIN)
 ```
 
-`SET LOCAL` scopes changes to the current transaction,
-so nothing leaks.
+`SET LOCAL` scopes changes to the current transaction, so nothing leaks.
+It is usually not recommended to override planner settings.
+However, in our testing PostgreSQL chose the wrong path quite often,
+so we don't really have a choice here.
 
 ### Prepared Statements
 
-If your database driver uses prepared statements,
-beware of generic plans.
+If your database driver uses prepared statements, beware of generic plans.
 PostgreSQL uses custom plans for the first few executions,
 taking current `SET LOCAL` settings into account.
 After several executions it may switch to a generic plan
 that was optimised without the planner overrides —
 undoing the `SET LOCAL` settings entirely.
 
-Use unprepared (simple-protocol) execution
-for leg queries to ensure the planner
-respects the overrides every time.
+We have to use unprepared (simple-protocol) execution
+for leg queries to ensure the planner respects the overrides every time.
 
 ## Final Sorting
 
-After all legs have contributed their candidates,
-deduplicate and sort:
+After all legs have contributed their candidates, deduplicate and sort:
 
 ```sql
 select nickname from (
@@ -461,27 +467,20 @@ order by nickname <-> 'lemberg_caviar' -- search term
 limit 10;
 ```
 
-The `<->` operator computes trigram distance —
-lower values mean closer matches.
-No index is needed here
-because the candidate set is small
-(at most a few hundred rows in the temp table,
-most likely cached in memory).
+The `<->` operator computes trigram distance — lower values mean closer matches.
+No index is needed here because the candidate set is small
+(at most a few hundred rows in the temp table, most likely cached in memory).
 
-The `DISTINCT` eliminates duplicates
-from legs that found the same row.
+The `DISTINCT` eliminates duplicates from legs that found the same row.
 The outer `LIMIT` returns only the top matches.
 
 ## Performance Techniques
 
-Use pipeline mode if your driver supports it
-(libpq, pgx) — all legs go in one batch,
-reducing round trips to a single flight.
+Use pipeline mode if your driver supports it (libpq, pgx) —
+all legs go in one batch, reducing round trips to a single flight.
 
-Keep everything in one transaction
-so `SET LOCAL` settings don't leak,
-the temp table lives for all legs,
-and you get a consistent snapshot.
+Keep everything in one transaction so `SET LOCAL` settings don't leak,
+the temp table lives for all legs, and you get a consistent snapshot.
 
 ## Results
 
@@ -512,10 +511,10 @@ Here are 20 randomly selected results:
 | `xyz`                               | 3   |
 | `zoe`                               | 4   |
 
-Over all 178 search terms: median = 31 ms, 90th percentile = 51 ms, maximum = 131 ms.
+Over all 178 search terms:
+median = 31 ms, 90th percentile = 51 ms, maximum = 131 ms.
 
-The raw `nickname` data is about 39 MB.
-Index sizes relative to the data:
+The raw `nickname` data is about 39 MB. Index sizes relative to the data:
 
 | Index                               | Size   | % of nickname data |
 | ----------------------------------- | ------ | ------------------ |
@@ -524,32 +523,67 @@ Index sizes relative to the data:
 | max_nonalnum_run (partial, INCLUDE) | 248 kB | < 1%               |
 | max_repeated_alnum_run (partial)    | 112 kB | < 1%               |
 
-The exact numbers depend on your data distribution,
-hardware, and query patterns,
+The exact numbers depend on your data distribution, hardware, and query patterns,
 but the technique consistently keeps searches fast
 across the full range of input shapes.
 
-The key takeaway:
-don't search for one perfect index strategy.
-Classify your inputs,
-run the right leg for each class,
-and let the union plus trigram sorting
-produce a cohesive result.
+The key takeaway: don't search for one perfect index strategy.
+Classify your inputs, run the right leg for each class,
+and let the union plus trigram sorting produce a cohesive result.
+
+This design deliberately optimizes for low and stable latency,
+not exhaustive recall.
+Each leg contributes a bounded number of candidates,
+and the final ranking happens only within that union.
+
+## Write-Side Cost of GIN
+
+The GIN trigram index is the largest index in the table in our case
+and also the most expensive to maintain during writes.
+
+The problem is, normally for every row you need to update just one index record.
+But GIN maps each trigram to every row containing it,
+so for each new nickname GIN must add a record for every trigram in the nickname.
+
+We benchmarked 200-row operations on a 3.3-million-row table
+(same DigitalOcean setup as the read benchmarks).
+Each result averaged over 10 iterations:
+
+| Operation                          | Without GIN | With GIN | Slower by |
+| ---------------------------------- | ----------- | -------- | --------- |
+| Pure `INSERT`                      | 227 ms      | 425 ms   | ~87%      |
+| Pure `UPDATE`                      | 333 ms      | 569 ms   | ~71%      |
+| `INSERT ... ON CONFLICT DO UPDATE` | 443 ms      | 898 ms   | ~103%     |
+
+Even `UPDATE` statements that do not modify `nickname`
+can still pay the GIN cost.
+PostgreSQL writes a new heap tuple version for every update.
+If the update cannot be done as a HOT (Heap-Only Tuple) update —
+because there is not enough free space on the same page,
+or because an indexed column changed —
+PostgreSQL must create new index entries
+for the new tuple version, including in the GIN index.
+
+The upsert path (`INSERT ... ON CONFLICT DO UPDATE`) is the most expensive
+because it attempts an insert first, tentatively touching GIN,
+before falling back to an update on conflict.
+
+For a read-heavy workload like search, this is an acceptable trade-off —
+the GIN index makes reads orders of magnitude faster.
+But for tables with frequent writes, the overhead is worth monitoring.
+We did not tune GIN maintenance parameters here;
+the write benchmarks reflect default managed-Postgres settings.
 
 ## Testing Tool
 
 The [companion repository](https://github.com/bcmk/siren-fuzzy-search)
 includes an interactive terminal tool
 for testing search against a live database.
-It connects to PostgreSQL directly,
-runs all the legs described above,
-and shows results with per-leg timings
-as you type.
+It connects to PostgreSQL directly, runs all the legs described above,
+and shows results with per-leg timings as you type.
 
-The tool helped catch slow edge cases early —
-you can try any input pattern
-and immediately see which legs fire
-and how long each one takes.
+The tool helped catch slow edge cases early — you can try any input pattern
+and immediately see which legs fire and how long each one takes.
 
 ## Where We Use This
 
