@@ -72,9 +72,9 @@ But it has its own blind spots.
 
 ## When GIN Trigrams Break Down
 
-**Short search terms** match a huge fraction of the table.
+**Short search terms** are slow because the index must build huge bitmaps.
 For example, `"ab"` produces space-padded trigrams like `"  a"` and `" ab"`,
-which are much more common than 3 letter trigrams.
+which are much more common than 3-letter trigrams and thus match far more rows.
 A GIN trigram index on 3.3 million rows
 returns 1.7 million candidate rows for `"ab"` —
 worse yet, GIN must build the entire bitmap before returning any row,
