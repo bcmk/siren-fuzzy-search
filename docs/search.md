@@ -35,14 +35,14 @@ order by dist
 limit 10;
 ```
 
-This uses a GiST index to find the closest matches by trigram distance.
-GIN, the other option provided by this extension,
-cannot accelerate the `<->` (trigram distance) operator.
-
 In my testing on a DigitalOcean managed database (1 vCPU, 1 GB RAM)
 it worked well until it became unusable at around 1 million rows.
 Meanwhile latency sometimes went up to 800 ms (90th percentile),
 outliers could reach 5 seconds.
+
+This uses a GiST index to find the closest matches by trigram distance.
+GIN, the other option provided by this extension,
+cannot accelerate the `<->` (trigram distance) operator.
 
 GiST is a tree index.
 Each leaf stores a lossy signature (a fixed-size bitfield) of a row's trigrams.
@@ -72,8 +72,9 @@ But it has its own blind spots.
 
 ## When GIN Trigrams Break Down
 
-**Short search terms**, e.g., `"ab"`, produce space-padded trigrams
-like `"  a"` and `" ab"` that match a huge fraction of the table.
+**Short search terms** match a huge fraction of the table.
+For example, `"ab"` produces space-padded trigrams like `"  a"` and `" ab"`,
+which are much more common than 3 letter trigrams.
 A GIN trigram index on 3.3 million rows
 returns 1.7 million candidate rows for `"ab"` —
 worse yet, GIN must build the entire bitmap before returning any row,
