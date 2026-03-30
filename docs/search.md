@@ -531,7 +531,7 @@ The key takeaway: don't search for one perfect index strategy.
 Classify your inputs, run the right leg for each class,
 and let the union plus trigram sorting produce a cohesive result.
 
-This design deliberately optimizes for low and stable latency,
+This design deliberately optimises for low and stable latency,
 not exhaustive recall.
 Each leg contributes a bounded number of candidates,
 and the final ranking happens only within that union.
