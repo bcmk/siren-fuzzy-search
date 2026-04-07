@@ -283,8 +283,9 @@ def redraw(
     res: list[str],
     timings: list[tuple[str, float]],
 ) -> None:
-    leg_count = sum(1 for name, _ in timings if name != "total")
-    timing_rows = max(leg_count, 1)
+    leg_timings = [x for x in timings if x[0] != "total"]
+    total_timing = next((t for name, t in timings if name == "total"), None)
+    timing_rows = max(len(leg_timings), 1)
     _, cols = win.getmaxyx()
     win.resize(MAX_RESULTS + timing_rows + 3, cols)
     win.erase()
@@ -294,22 +295,21 @@ def redraw(
 
     win.box()
 
-    # Vertical divider in top section
-    win.addch(0, DIVIDER_COL, curses.ACS_TTEE)
-    for row in range(1, h_divider):
-        win.addch(row, DIVIDER_COL, curses.ACS_VLINE)
+    if leg_timings:
+        # Vertical divider in top section
+        win.addch(0, DIVIDER_COL, curses.ACS_TTEE)
+        for row in range(1, h_divider):
+            win.addch(row, DIVIDER_COL, curses.ACS_VLINE)
 
     # Horizontal divider before results
     win.addch(h_divider, 0, curses.ACS_LTEE)
     win.hline(h_divider, 1, curses.ACS_HLINE, cols - 2)
-    win.addch(h_divider, DIVIDER_COL, curses.ACS_BTEE)
+    if leg_timings:
+        win.addch(h_divider, DIVIDER_COL, curses.ACS_BTEE)
     win.addch(h_divider, cols - 1, curses.ACS_RTEE)
 
     prompt = "> " + query
     win.addstr(1, 1, prompt)
-
-    leg_timings = [x for x in timings if x[0] != "total"]
-    total_timing = next((t for name, t in timings if name == "total"), None)
 
     for i, (name, t) in enumerate(leg_timings):
         win.addstr(
@@ -321,7 +321,10 @@ def redraw(
 
     if total_timing is not None:
         total_str = f"total time: {total_timing:.0f} ms"
-        win.addstr(h_divider - 1, DIVIDER_COL - 1 - len(total_str), total_str, curses.A_DIM)
+        if leg_timings:
+            win.addstr(h_divider - 1, DIVIDER_COL - 1 - len(total_str), total_str, curses.A_DIM)
+        else:
+            win.addstr(1, cols - 2 - len(total_str), total_str, curses.A_DIM)
 
     for i, r in enumerate(res[:MAX_RESULTS]):
         win.addstr(h_divider + 1 + i, 3, r)
