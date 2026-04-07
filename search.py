@@ -3,50 +3,17 @@
 import argparse
 import curses
 import queue
-import sys
 import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-import configargparse
 import psycopg
 
+from check_indexes import check_indexes
+from config import parse_args
+
 MAX_RESULTS = 7
-
-
-def parse_args() -> argparse.Namespace:
-    p = configargparse.ArgParser(default_config_files=["config.ini"])
-    p.add("-c", "--config", is_config_file=True, help="config file path")
-    p.add("--db-connection-string", required=True, env_var="DB_CONNECTION_STRING", help="PostgreSQL connection string")
-    p.add("--schema", default="public", help="database schema (default: %(default)s)")
-    p.add("--table", required=True, help="default table for all search legs")
-    p.add("--field", required=True, help="column name to search")
-    p.add("--exact-table", help="table for exact match leg (default: --table)")
-    p.add("--substring-table", help="table for substring leg (default: --table)")
-    p.add("--similarity-table", help="table for similarity leg (default: --table)")
-    p.add("--alnum-runs-table", help="table for repeated alnum runs leg (default: --table)")
-    p.add("--nonalnum-runs-table", help="table for nonalnum runs leg (default: --table)")
-    p.add("--prefix-table", help="table for prefix match leg (default: --table)")
-    p.add("--debounce-ms", type=int, default=300, help="input debounce delay in ms (default: %(default)s)")
-    p.add(
-        "--leg-times",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="show per-leg timings",
-    )
-    cfg = p.parse_args()
-    for attr in (
-        "exact_table",
-        "substring_table",
-        "similarity_table",
-        "alnum_runs_table",
-        "nonalnum_runs_table",
-        "prefix_table",
-    ):
-        if getattr(cfg, attr) is None:
-            setattr(cfg, attr, cfg.table)
-    return cfg
 
 
 def analyze_query(query: str) -> tuple[int, int, int, int] | None:
@@ -77,68 +44,6 @@ def analyze_query(query: str) -> tuple[int, int, int, int] | None:
         max_repeated_alnum_run = max(max_repeated_alnum_run, repeated_alnum_run)
         prev = c
     return alnum_count, max_alnum_run, max_repeated_alnum_run, max_nonalnum_run
-
-
-def check_indexes(conn: psycopg.Connection, cfg: argparse.Namespace) -> None:
-    field = cfg.field
-    tables = {
-        cfg.exact_table,
-        cfg.substring_table,
-        cfg.similarity_table,
-        cfg.alnum_runs_table,
-        cfg.nonalnum_runs_table,
-        cfg.prefix_table,
-    }
-    indexdefs: dict[str, list[str]] = {t: [] for t in tables}
-    with conn.transaction():
-        cur = conn.execute(
-            "select tablename, indexdef from pg_indexes where schemaname = %(schema)s and tablename = any(%(tables)s)",
-            {"schema": cfg.schema, "tables": list(tables)},
-        )
-        for table_name, indexdef in cur.fetchall():
-            indexdefs[table_name].append(indexdef.lower())
-        cur = conn.execute(
-            """
-            select collation_name from information_schema.columns
-            where table_schema = %(schema)s and table_name = %(table)s and column_name = %(field)s
-            """,
-            {"schema": cfg.schema, "table": cfg.prefix_table, "field": field},
-        )
-        row = cur.fetchone()
-        # row is None → table/column not in information_schema (will fail at index check below)
-        # row[0] is None → column uses the database default collation; check datcollate
-        if row is not None and row[0] is None:
-            cur = conn.execute("select datcollate from pg_database where datname = current_database()")
-            db_row = cur.fetchone()
-            collation = db_row[0] if db_row is not None else None
-        elif row is not None:
-            collation = row[0]
-        else:
-            collation = None
-    btree_any = [f"using btree ({field})", f"using btree ({field} text_pattern_ops)"]
-    if collation in ("C", "POSIX"):
-        prefix_btree = btree_any
-    else:
-        prefix_btree = [f"using btree ({field} text_pattern_ops)"]
-    requirements: list[tuple[str, list[str]]] = [
-        (cfg.exact_table, btree_any),
-        (cfg.substring_table, [f"using gin ({field} gin_trgm_ops)"]),
-        (cfg.similarity_table, [f"using gin ({field} gin_trgm_ops)"]),
-        (cfg.alnum_runs_table, [f"max_repeated_alnum_run({field})"]),
-        (cfg.nonalnum_runs_table, [f"max_nonalnum_run({field})"]),
-        (cfg.prefix_table, prefix_btree),
-    ]
-    missing: list[str] = []
-    for table, patterns in requirements:
-        if not any(any(p in d for d in indexdefs[table]) for p in patterns):
-            msg = f"  {table}: {' or '.join(patterns)}"
-            if msg not in missing:
-                missing.append(msg)
-    if missing:
-        print("missing index patterns:")
-        for m in missing:
-            print(m)
-        sys.exit(1)
 
 
 def search(
