@@ -10,7 +10,7 @@ from contextlib import contextmanager
 
 import psycopg
 
-from check_indexes import check_indexes
+from check_prerequisites import check_extensions, check_indexes
 from config import parse_args
 
 MAX_RESULTS = 7
@@ -239,14 +239,17 @@ def search(
                     prepare=False,
                 )
 
-        # Results are deduplicated and sorted by trigram distance.
+        # Results are deduplicated and sorted by a weighted sum of trigram and Levenshtein distances.
         with leg_pipeline("sort"):
             cur.execute(
                 psycopg.sql.SQL(
                     """
                     select {field} from
                     (select distinct {field} from _search_results) sub
-                    order by {field} <-> %(query)s
+                    order by
+                        2 * ({field} <-> %(query)s)
+                        + levenshtein(left({field}, 255), left(%(query)s, 255))::float
+                            / greatest(length({field}), length(%(query)s), 1)
                     limit 7
                     """
                 ).format(field=field),
@@ -385,6 +388,7 @@ def interactive(
 def main() -> None:
     cfg = parse_args()
     conn = psycopg.connect(cfg.db_connection_string)
+    check_extensions(conn)
     check_indexes(conn, cfg)
     curses.wrapper(interactive, conn, cfg)
 

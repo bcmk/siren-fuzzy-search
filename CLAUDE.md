@@ -8,6 +8,8 @@
 
 - Use lowercase SQL keywords in code blocks,
   uppercase in prose (e.g. `SELECT`, `LIKE`, `SET LOCAL`)
+- Write SQL result comments in JSON format, not raw Postgres array text
+  (e.g. `-- ["a", "b"]`, not `-- {a,b}`)
 
 ## Checks
 

@@ -2,7 +2,7 @@
 
 There are plenty of articles about fuzzy search in PostgreSQL.
 However, when I tried these approaches on a table with a few million rows,
-some search terms turned out to be hundreds of times slower than others.
+some search queries turned out to be hundreds of times slower than others.
 So let's build fuzzy search that stays fast regardless of inputs.
 
 ![Search testing tool](ui-screenshot.png)
@@ -13,16 +13,21 @@ Let's say we have a table `people` with ~3 million rows.
 Each row has a `nickname` field consisting of lowercase `a-z`, `0-9`, and `_`.
 We want to fuzzy search these nicknames.
 
-Soundex and full-text search are usually a poor fit here —
-nicknames are not natural language words.
+Some approaches can be ruled out right away.
+Soundex relies on how English words sound,
+but nicknames like `xx_42z` have no pronunciation.
+Full-text search splits input into dictionary words and stems them —
+nicknames are not natural language words, so there is nothing to stem.
 
 ## The Textbook Approach
 
-The most natural and precise approach is described
-in PostgreSQL's `pg_trgm` extension
+Naturally we may want to just sort our nicknames
+by some similarity measure to our search term
+and pick the best matches.
+This is exactly the approach described in PostgreSQL's `pg_trgm` extension
 [documentation](https://www.postgresql.org/docs/current/pgtrgm.html).
-The extension provides trigram-based similarity.
-So why don't we just sort by similarity and print out the best matches?
+The extension provides trigram-based similarity,
+so why don't we use it to sort?
 
 ```sql
 create extension if not exists pg_trgm;
@@ -35,17 +40,17 @@ order by dist
 limit 10;
 ```
 
+And it works well, but unfortunately not at scale.
 In my testing on a DigitalOcean managed database (1 vCPU, 1 GB RAM)
-it worked well until it became unusable at around 1 million rows.
-Meanwhile latency sometimes went up to 800 ms (90th percentile),
-outliers could reach 5 seconds.
+it became unusable at around 1 million rows —
+latency went up to 800 ms (90th percentile),
+with outliers reaching 5 seconds.
 
-This uses a GiST index to find the closest matches by trigram distance.
-GIN, the other option provided by this extension,
-cannot accelerate the `<->` (trigram distance) operator.
+This uses a GiST index — the only index type in `pg_trgm`
+that can accelerate the `<->` (trigram distance) operator.
 
 GiST is a tree index.
-Each leaf stores a lossy signature (a fixed-size bitfield) of a row's trigrams.
+Each leaf stores a lossy signature (a fixed-size bitfield) of a nickname's trigrams.
 Each trigram hashes to a bit position in the signature,
 but different trigrams can collide —
 hypothetically, `"aaa"`, `"bbb"`, and `"ccc"` might all set bit 5.
@@ -72,7 +77,7 @@ But it has its own blind spots.
 
 ## When GIN Trigrams Break Down
 
-**Short search terms** are slow because the index must build huge bitmaps.
+**Short search terms** are slow because the index must build huge bitmaps first.
 For example, `"ab"` produces space-padded trigrams like `"  a"` and `" ab"`,
 which are much more common than 3-letter trigrams and thus match far more rows.
 A GIN trigram index on 3.3 million rows
@@ -82,15 +87,25 @@ which takes up to 8 seconds in my tests.
 
 **Repeated characters** cause too many false positives.
 For example, let's work through a condition `LIKE '%aaaaaa%'`.
-The search term `"aaaaaa"` produces a single useful trigram `"aaa"` —
 `pg_trgm` does not count how many times a trigram occurs,
 it only checks its presence.
-So GIN only narrows results to rows containing `"aaa"` —
-most of which don't actually contain `"aaaaaa"`.
+So `"aaa"` and `"aaaaaaa"` produce the same trigrams:
+
+```sql
+select show_trgm('aaa');      -- ["  a", " aa", "aaa", "aa "]
+select show_trgm('aaaaaaa');  -- ["  a", " aa", "aaa", "aa "]
+```
+
+PostgreSQL needs these space-padded trigrams to match word boundaries,
+but since our pattern `%aaaaaa%` has wildcards on both sides,
+it really uses only `"aaa"` for this query.
+So GIN returns every row containing `"aaa"` as a candidate,
+and PostgreSQL must recheck them against `LIKE '%aaaaaa%'` —
+obviously most don't match.
 This makes the search painfully slow.
 
 **Non-alphanumeric characters** are invisible to `pg_trgm`.
-`show_trgm('_____')` returns an empty array.
+`select show_trgm('_____')` returns an empty array.
 A username made of underscores
 cannot be narrowed by any PostgreSQL trigram index.
 
@@ -105,9 +120,20 @@ Instead of handling all inputs with one query,
 let's split the search into multiple legs
 and pick the ones that are fast for the specific search term at hand.
 We decide which legs to run on the application side,
-then deduplicate their results and sort by trigram distance.
-We use a temp table rather than `UNION ALL` CTEs
-because each leg needs its own `SET LOCAL` planner overrides.
+then deduplicate their results and choose best matches (sort by distance).
+Each leg needs its own `SET LOCAL` planner overrides (more on this below),
+so we collect results in a transaction-scoped temp table rather than `UNION` CTEs.
+
+### Prerequisites
+
+We need two extensions:
+
+```sql
+create extension if not exists pg_trgm;
+create extension if not exists fuzzystrmatch;
+```
+
+### Example
 
 ```sql
 begin;
@@ -135,25 +161,24 @@ limit 100;
 select nickname from (
     select distinct nickname from _search_results
 ) sub
-order by nickname <-> 'lemberg_caviar' -- search term
+order by
+    2 * (nickname <-> 'lemberg_caviar') -- search term
+    + levenshtein(left(nickname, 255), left('lemberg_caviar', 255))::float
+        / greatest(length(nickname), length('lemberg_caviar'), 1)
 limit 10;
 
 commit;
 ```
 
-In this example all legs run unconditionally.
-In practice, we analyse the search term first
-and only enable the legs that are fast
+This example runs all legs unconditionally.
+In practice, we only activate legs that will be fast
 for the given search term — more on this below.
 
-Ideally each leg would return the closest matches by trigram distance,
+Ideally each leg would sort by distance first and then return closest matches,
 but such ordering is too expensive on large tables.
-So each "fuzzy" leg collects `LIMIT 100` in arbitrary order —
+So each "fuzzy" leg just collects 100 arbitrary nicknames that match its filter —
 which turns out to be good enough in practice —
 and the final sort ranks only those candidates.
-
-The temporary table with `ON COMMIT DROP`
-cleans itself up when the transaction ends.
 
 ## The Legs
 
@@ -167,12 +192,12 @@ where nickname = 'lemberg_caviar'; -- search term
 
 Uses a B-tree index to check
 if the search term matches an existing record exactly.
-This is cheap and ensures an exact match is included if one exists.
+This is cheap and ensures an exact match is always included if one exists.
 
 **Activate when:** always.
 
-**Prerequisites:** a B-tree index with `text_pattern_ops`, which also supports `=`.
-Actually you can use a plain B-tree index (without `text_pattern_ops`);
+**Prerequisites:** a B-tree index with `text_pattern_ops`, which supports the equality operator (`=`) as well.
+A plain B-tree index (without `text_pattern_ops`) may work too;
 more on this in leg 6.
 
 ```sql
@@ -195,19 +220,25 @@ limit 100;
 ```
 
 `'lemberg\_caviar'` is the search term with `LIKE` metacharacters escaped:
-`_` ⟶ `\_`, `%` ⟶ `\%`, `\` ⟶ `\\`.
 
-This is the workhorse leg.
-`pg_trgm` uses the search term's trigrams to produce candidate rows,
+```
+_  ⟶  \_
+%  ⟶  \%
+\  ⟶  \\
+```
+
+This is our workhorse leg.
+`pg_trgm` produces candidate rows that contain trigrams from the search term,
 which are then rechecked against the `LIKE` predicate.
 
 **Activate when:**
 
-- the longest alphanumeric run in the search term is at least 3
+- the longest alphanumeric run in the search term is at least 3 characters
   (shorter runs can produce trigrams that match too many rows,
   so PostgreSQL must build a huge bitmap before returning data)
-- the longest repeated-character run in the search term is below 5
-  (above that, the single useful trigram matches too broadly)
+- the longest repeated-character run in the search term is below 5 characters
+  (`pg_trgm` does not distinguish `'aaa'` from `'aaaaaaa'` in terms of trigrams,
+  so the index returns too many false positives)
 
 **Prerequisites:** a GIN trigram index.
 
@@ -280,13 +311,13 @@ limit 100;
 ```
 
 Some queries defeat `pg_trgm` entirely —
-`"aaaaaa"` produces a single useful trigram `"aaa"`,
-which matches far too many rows.
+`"aaa"` and `"aaaaaaa"` produce the same trigrams,
+so the index can't tell a short run from a long one.
 A functional index on the longest repeated run
 helps narrow the search (via BitmapAnd).
 
 **Activate when:** the longest repeated-character run
-in the search term is at least 5.
+in the search term is at least 5 characters.
 
 **Prerequisites:** a custom SQL function and a partial index.
 
@@ -304,7 +335,7 @@ create index on people (
 
 The regex assumes lowercase ASCII nicknames (`[a-z0-9]`),
 matching the alphabet defined in the Problem section.
-The partial index is quite small.
+The partial index is tiny for typical nickname data.
 
 ### 5. Non-Alnum Rescue Leg (accelerated by longest non-alnum run index)
 
@@ -329,11 +360,11 @@ limit 100;
 The same technique with a function
 that measures the longest non-alphanumeric run.
 Since `pg_trgm` produces zero trigrams
-for these characters (`show_trgm('_____')` returns `{}`),
+for these characters (`select show_trgm('_____')` returns `{}`),
 this leg is an effective way to find such patterns.
 
 **Activate when:** the longest non-alphanumeric run
-in the search term is at least 3.
+in the search term is at least 3 characters.
 
 **Prerequisites:** same technique as leg 4.
 
@@ -350,7 +381,7 @@ create index on people (
 where max_nonalnum_run(nickname) >= 3;
 ```
 
-The partial index is quite small and `INCLUDE` enables index-only scans.
+The partial index is tiny for typical nickname data and `INCLUDE` enables index-only scans.
 
 ### 6. Prefix Fallback Leg
 
@@ -374,29 +405,33 @@ where substring or similarity would match almost arbitrary strings.
 
 **Activate when:** no other content-based leg qualifies:
 
-- longest alphanumeric run in the search term below 3
-- longest non-alphanumeric run in the search term below 3
+- longest alphanumeric run in the search term below 3 characters
+- longest non-alphanumeric run in the search term below 3 characters
 
 **Prerequisites:** the same `text_pattern_ops` B-tree index as leg 1.
-Actually you can use a plain B-tree index (without `text_pattern_ops`),
-if you use `collate "C"`, which is justified in our case —
-nicknames are always Latin.
+This operator class (`text_pattern_ops`) allows prefix search e.g. on UTF-8 strings
+by effectively applying `collate "C"` just to the index.
 
-Note that `collate "C"` uses raw byte ordering, so comparisons become
-case-sensitive and locale-unaware — `'Z' < 'a'` and accented characters
-sort by their byte values rather than linguistic rules.
-A regular B-tree index can only accelerate `LIKE` prefix queries
-under the C collation.
-Most databases use a locale-aware collation like `en_US.UTF-8`,
-so you would need to specify `collate "C"` yourself.
-`text_pattern_ops` uses byte-wise comparison,
-so prefix `LIKE` works regardless of collation.
+**A plain B-tree vs. `text_pattern_ops`:**
+a plain B-tree index (without `text_pattern_ops`) may work too,
+if the field has "C" collation.
+Under "C" collation PostgreSQL compares bytes rather than characters, ignoring linguistic rules —
+and that's also what enables prefix search acceleration.
+This works for our nicknames problem — they are ASCII-only.
+
+So if you already have a plain B-tree index and use it for e.g. `ORDER BY`,
+sometimes you can reuse it rather than creating an almost identical separate `text_pattern_ops` index.
+Such a B-tree index supports both prefix search and regular `ORDER BY`, just beware of "C" collation ordering limitations.
+You would need to specify the field `collate "C"` explicitly unless the database default is already `C`.
+
+You might wonder why not use `text_pattern_ops` for both `ORDER BY` and prefix search.
+The answer is you can't — it uses different comparison operators (`~<~`, `~>~`)
+and regular `ORDER BY` won't use it.
 
 ## Which Legs to Run
 
-To make decisions on which legs to run
-according to **Activate when** conditions you see above,
-let's analyse the search term on the application side:
+To decide which legs to activate (see **Activate when** above),
+we analyse the search term on the application side:
 
 | Metric            | What it measures                                 |
 | ----------------- | ------------------------------------------------ |
@@ -422,6 +457,57 @@ Here is a summary of the activation rules:
 | Repeated-run rescue | Handle inputs like `aaaaaa` | Max repeated run ≥ 5                       |
 | Non-alnum rescue    | Handle inputs like `___`    | Max non-alnum run ≥ 3                      |
 | Prefix fallback     | Low-information fallback    | No stronger content-based leg qualifies    |
+
+## Final Sorting
+
+After all legs have contributed their candidates, deduplicate, sort by distance, and return the best matches.
+The candidate set is at most a few hundred rows — no index is needed here.
+
+```sql
+select nickname from (
+    select distinct nickname from _search_results
+) sub
+order by
+    2 * (nickname <-> 'lemberg_caviar') -- search term
+    + levenshtein(left(nickname, 255), left('lemberg_caviar', 255))::float
+        / greatest(length(nickname), length('lemberg_caviar'), 1)
+limit 10;
+```
+
+We blend two distance metrics with complementary strengths.
+
+### Trigram Distance
+
+The `<->` operator has useful properties.
+For example, `'lemberg_caviar'` is not far from `'caviar_lemberg'`,
+so you still find it if you forgot the word order.
+It works on unordered sets of trigrams
+and computes `1 − count(shared trigrams) / count(all unique trigrams from both strings)` (Jaccard distance).
+
+### Levenshtein Distance
+
+```sql
+create extension if not exists fuzzystrmatch;
+```
+
+The `levenshtein` function from this extension
+counts the minimum number of single-character edits
+(insertions, deletions, substitutions)
+needed to transform one string into another.
+It helps distinguish strings that differ only in non-alphanumeric characters,
+where trigram distance sees no difference:
+
+```sql
+select 'x' <-> 'x_';  -- 0 (underscores are ignored by pg_trgm)
+select levenshtein('x', 'x_');  -- 1
+```
+
+We normalise it by dividing by the longer string's length
+to get a 0–1 ratio comparable to trigram distance.
+Note that `levenshtein` has a 255-character input limit;
+we cap both inputs with `left(..., 255)`.
+
+Trigram distance is weighted 2:1 over normalised Levenshtein — chosen empirically.
 
 ## Planner Control
 
@@ -455,25 +541,6 @@ undoing the `SET LOCAL` settings entirely.
 
 We have to use unprepared (simple-protocol) execution
 for leg queries to ensure the planner respects the overrides every time.
-
-## Final Sorting
-
-After all legs have contributed their candidates, deduplicate and sort:
-
-```sql
-select nickname from (
-    select distinct nickname from _search_results
-) sub
-order by nickname <-> 'lemberg_caviar' -- search term
-limit 10;
-```
-
-The `<->` operator computes trigram distance — lower values mean closer matches.
-No index is needed here because the candidate set is small
-(at most a few hundred rows in the temp table, most likely cached in memory).
-
-The `DISTINCT` eliminates duplicates from legs that found the same row.
-The outer `LIMIT` returns only the top matches.
 
 ## Performance Techniques
 
@@ -521,8 +588,8 @@ The raw `nickname` data is about 39 MB. Index sizes relative to the data:
 | ----------------------------------- | ------ | ------------------ |
 | GIN trigram                         | 122 MB | 313%               |
 | B-tree `text_pattern_ops`           | 100 MB | 256%               |
-| max_nonalnum_run (partial, INCLUDE) | 248 kB | < 1%               |
-| max_repeated_alnum_run (partial)    | 112 kB | < 1%               |
+| max_nonalnum_run (partial, INCLUDE) | 248 kB | 0.6%               |
+| max_repeated_alnum_run (partial)    | 112 kB | 0.3%               |
 
 The exact numbers depend on your data distribution, hardware, and query patterns,
 but the technique consistently keeps searches fast
@@ -530,7 +597,7 @@ across the full range of input shapes.
 
 The key takeaway: don't search for one perfect index strategy.
 Classify your inputs, run the right leg for each class,
-and let the union plus trigram sorting produce a cohesive result.
+and let the union plus blended sorting produce a cohesive result.
 
 This design deliberately optimises for low and stable latency,
 not exhaustive recall.
@@ -574,6 +641,12 @@ the GIN index makes reads orders of magnitude faster.
 But for tables with frequent writes, the overhead is worth monitoring.
 We did not tune GIN maintenance parameters here;
 the write benchmarks reflect default managed-Postgres settings.
+
+If your table has frequent writes but the fuzzy search field rarely changes,
+it may help to duplicate it into a separate table
+where the fuzzy search indexes are defined.
+This way writes to the main table don't touch GIN at all.
+We use this approach and it made our updates much faster.
 
 ## Testing Tool
 

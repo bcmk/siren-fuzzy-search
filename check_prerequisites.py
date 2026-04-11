@@ -8,6 +8,22 @@ import psycopg
 from config import parse_args
 
 
+def check_extensions(conn: psycopg.Connection) -> None:
+    required = {"pg_trgm", "fuzzystrmatch"}
+    with conn.transaction():
+        cur = conn.execute(
+            "select extname from pg_extension where extname = any(%(exts)s)",
+            {"exts": list(required)},
+        )
+        installed = {row[0] for row in cur.fetchall()}
+    missing_exts = required - installed
+    if missing_exts:
+        print("missing extensions; install with:")
+        for ext in sorted(missing_exts):
+            print(f"  create extension if not exists {ext};")
+        sys.exit(1)
+
+
 def check_indexes(conn: psycopg.Connection, cfg: argparse.Namespace) -> None:
     field = cfg.field
     tables = {
@@ -73,6 +89,7 @@ def check_indexes(conn: psycopg.Connection, cfg: argparse.Namespace) -> None:
 def main() -> None:
     cfg = parse_args()
     conn = psycopg.connect(cfg.db_connection_string)
+    check_extensions(conn)
     check_indexes(conn, cfg)
     conn.close()
     print("all indexes ok")
