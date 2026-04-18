@@ -155,7 +155,7 @@ where nickname %> 'lemberg_caviar' -- search term
 limit 100;
 
 -- other legs: substring, repeated characters,
--- non-alphanumeric runs, prefix — details below
+-- non-alphanumeric runs, prefix (details below)
 
 -- deduplicate + sort
 select nickname from (

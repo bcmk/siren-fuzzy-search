@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""Compare a saved Medium HTML against docs/search.md block-by-block.
+
+Usage: scripts/verify-medium <path-to-saved-medium-html>
+
+Walks both documents as a sequence of semantic blocks (headings,
+paragraphs, code blocks, figures, lists, tables) and reports:
+  - structural mismatches (missing / extra / reordered blocks,
+    including heading-level regressions like md `###` landing as
+    `<h2>` after paste)
+  - content mismatches (text differs after normalisation)
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+from bs4 import BeautifulSoup
+
+LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+BOLD_STAR_RE = re.compile(r"\*\*([^*]+)\*\*")
+BOLD_UNDER_RE = re.compile(r"(?<!\w)__([^_]+)__(?!\w)")
+ITALIC_STAR_RE = re.compile(r"(?<!\*)\*([^*]+)\*(?!\*)")
+ITALIC_UNDER_RE = re.compile(r"(?<!\w)_([^_]+)_(?!\w)")
+FENCE_RE = re.compile(r"^\s*(```|~~~)")
+HEADING_RE = re.compile(r"^(#+)\s+(.*)")
+CHROME = {"Listen", "Share", "More", "Follow"}
+
+
+def parse_md(md: str) -> list[tuple[str, str]]:
+    blocks: list[tuple[str, str]] = []
+    lines = md.split("\n")
+    i = 0
+    in_fence = False
+    fence_marker = ""
+    para: list[str] = []
+
+    def flush_para() -> None:
+        if para:
+            blocks.append(("p", " ".join(p for p in para if p).strip()))
+            para.clear()
+
+    while i < len(lines):
+        line = lines[i]
+        if in_fence:
+            if line.lstrip().startswith(fence_marker):
+                blocks.append(("pre", "\n".join(para)))
+                in_fence = False
+                para.clear()
+            else:
+                para.append(line)
+            i += 1
+            continue
+        m = FENCE_RE.match(line)
+        if m:
+            flush_para()
+            in_fence = True
+            fence_marker = m.group(1)
+            i += 1
+            continue
+        if line.startswith("#"):
+            flush_para()
+            mh = HEADING_RE.match(line)
+            if mh:
+                blocks.append((f"h{len(mh.group(1))}", mh.group(2)))
+            i += 1
+            continue
+        if line.startswith("!["):
+            flush_para()
+            blocks.append(("figure", line))
+            i += 1
+            continue
+        if line.strip().startswith("|"):
+            flush_para()
+            rows: list[str] = []
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                rows.append(lines[i])
+                i += 1
+            blocks.append(("table", "\n".join(rows)))
+            continue
+        if line.strip().startswith("- "):
+            flush_para()
+            items: list[str] = []
+            while i < len(lines) and (lines[i].strip().startswith("- ") or (items and lines[i].startswith("  "))):
+                items.append(lines[i])
+                i += 1
+            blocks.append(("ul", "\n".join(items)))
+            continue
+        if line.strip() == "":
+            flush_para()
+            i += 1
+            continue
+        para.append(line.strip())
+        i += 1
+    flush_para()
+    return blocks
+
+
+def parse_html(path: Path) -> list[tuple[str, str]]:
+    html = path.read_text()
+    soup = BeautifulSoup(html, "html.parser")
+    article = soup.find("article")
+    if article is None:
+        raise SystemExit(f"no <article> element in {path}")
+
+    blocks: list[tuple[str, str]] = []
+    for el in article.find_all(
+        ["h1", "h2", "h3", "h4", "h5", "h6", "p", "pre", "figure", "blockquote", "ul", "ol"],
+        recursive=True,
+    ):
+        if any(p.name in ("figure", "blockquote", "pre", "ul", "ol") for p in el.parents if p is not article):
+            continue
+        if el.name == "pre":
+            for br in el.find_all("br"):
+                br.replace_with("\n")
+            text = el.get_text("")
+        elif el.name in ("ul", "ol"):
+            text = el.get_text("\n")
+        else:
+            text = el.get_text("")
+        if not text.strip():
+            continue
+        if el.name == "p" and text.strip() in CHROME:
+            continue
+        blocks.append((el.name, text))
+    return blocks
+
+
+def norm_prose(s: str) -> str:
+    s = LINK_RE.sub(r"\1", s)
+    s = BOLD_STAR_RE.sub(r"\1", s)
+    s = BOLD_UNDER_RE.sub(r"\1", s)
+    s = ITALIC_STAR_RE.sub(r"\1", s)
+    s = ITALIC_UNDER_RE.sub(r"\1", s)
+    s = s.replace("`", "")
+    s = (
+        s.replace("\u2019", "'")
+        .replace("\u2018", "'")
+        .replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\xa0", " ")
+    )
+    return s
+
+
+def squish(s: str) -> str:
+    return re.sub(r"\s+", "", s)
+
+
+def norm_ul(s: str) -> str:
+    return "\n".join(re.sub(r"^\s*-\s*", "", ln) for ln in s.split("\n"))
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print("usage: scripts/verify-medium <path-to-medium-html>", file=sys.stderr)
+        return 2
+    html_path = Path(sys.argv[1])
+    root = Path(__file__).resolve().parent.parent
+    md_path = root / "docs" / "search.md"
+
+    md_blocks = parse_md(md_path.read_text())
+    html_blocks = parse_html(html_path)
+    html_blocks = html_blocks[: len(md_blocks)]
+
+    print(f"MD blocks: {len(md_blocks)}")
+    print(f"HTML blocks (trimmed): {len(html_blocks)}")
+
+    def normalise_type(t: str) -> str:
+        return "pre" if t == "table" else t
+
+    md_seq = [normalise_type(t) for t, _ in md_blocks]
+    html_seq = [normalise_type(t) for t, _ in html_blocks]
+
+    from difflib import SequenceMatcher
+
+    sm = SequenceMatcher(None, md_seq, html_seq)
+    struct_ratio = sm.ratio()
+    print(f"Structural similarity (type sequence): {struct_ratio:.3f}")
+
+    def preview(text: str) -> str:
+        return re.sub(r"\s+", " ", text).strip()[:80]
+
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            continue
+        print(f"  {tag}: MD[{i1}:{i2}]={md_seq[i1:i2]} vs HTML[{j1}:{j2}]={html_seq[j1:j2]}")
+        for k in range(i1, i2):
+            print(f"    MD[{k}] ({md_blocks[k][0]}): {preview(md_blocks[k][1])}")
+        for k in range(j1, j2):
+            print(f"    HTML[{k}] ({html_blocks[k][0]}): {preview(html_blocks[k][1])}")
+
+    def norm_pre(s: str) -> str:
+        return "\n".join(ln.rstrip() for ln in s.splitlines()).strip("\n")
+
+    content_mismatches: list[tuple[int, str, str, str, str]] = []
+    for i, ((mt, mc), (ht, hc)) in enumerate(zip(md_blocks, html_blocks)):
+        if mt in ("figure", "table"):
+            continue
+        if mt == "pre":
+            mn, hn = norm_pre(mc), norm_pre(hc)
+        elif mt == "ul":
+            mn, hn = squish(norm_prose(norm_ul(mc))), squish(norm_prose(hc))
+        else:
+            mn, hn = squish(norm_prose(mc)), squish(norm_prose(hc))
+        if mn != hn:
+            content_mismatches.append((i, mt, ht, mn, hn))
+
+    print(f"\nContent mismatches: {len(content_mismatches)} / {len(md_blocks)}")
+    for i, mt, ht, mn, hn in content_mismatches[:10]:
+        dif = 0
+        while dif < min(len(mn), len(hn)) and mn[dif] == hn[dif]:
+            dif += 1
+        print(f"\n  block {i} ({mt}/{ht}) first diff at char {dif}")
+        print(f"    MD:   ...{mn[max(0, dif - 30) : dif + 60]}...")
+        print(f"    HTML: ...{hn[max(0, dif - 30) : dif + 60]}...")
+
+    ok = struct_ratio == 1.0 and not content_mismatches
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

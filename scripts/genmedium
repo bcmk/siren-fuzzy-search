@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""Render docs/search.md to Medium-paste-friendly HTML.
+
+Medium's editor has no native tables, and pasting markdown tables into
+a code block silently drops inline formatting (backticks, italics),
+breaking column alignment. This preprocessor rewrites every GFM table
+as a fenced code block whose cells have inline markdown stripped and
+pipes re-aligned, then hands off to pandoc to render the rest.
+"""
+
+from __future__ import annotations
+
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+BOLD_STAR_RE = re.compile(r"\*\*([^*]+)\*\*")
+BOLD_UNDER_RE = re.compile(r"(?<!\w)__([^_]+)__(?!\w)")
+ITALIC_STAR_RE = re.compile(r"(?<!\*)\*([^*]+)\*(?!\*)")
+ITALIC_UNDER_RE = re.compile(r"(?<!\w)_([^_]+)_(?!\w)")
+CODE_SPLIT_RE = re.compile(r"(`[^`]*`)")
+SEPARATOR_CELL_RE = re.compile(r":?-+:?")
+FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
+H3_RE = re.compile(r"^###(\s)")
+
+
+def strip_inline(text: str) -> str:
+    out: list[str] = []
+    for part in CODE_SPLIT_RE.split(text):
+        if len(part) >= 2 and part.startswith("`") and part.endswith("`"):
+            out.append(part[1:-1])
+            continue
+        part = LINK_RE.sub(r"\1", part)
+        part = BOLD_STAR_RE.sub(r"\1", part)
+        part = BOLD_UNDER_RE.sub(r"\1", part)
+        part = ITALIC_STAR_RE.sub(r"\1", part)
+        part = ITALIC_UNDER_RE.sub(r"\1", part)
+        out.append(part)
+    return "".join(out)
+
+
+def is_table_row(line: str) -> bool:
+    return line.lstrip().startswith("|") and "|" in line.lstrip()[1:]
+
+
+def is_separator(line: str) -> bool:
+    s = line.strip().strip("|")
+    cells = [c.strip() for c in s.split("|")]
+    return bool(cells) and all(SEPARATOR_CELL_RE.fullmatch(c) for c in cells)
+
+
+def parse_row(line: str) -> list[str]:
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [c.strip() for c in s.split("|")]
+
+
+def format_table(rows: list[list[str]]) -> list[str]:
+    n_cols = max(len(r) for r in rows)
+    padded_rows = [r + [""] * (n_cols - len(r)) for r in rows]
+    widths = [max(len(r[i]) for r in padded_rows) for i in range(n_cols)]
+
+    def fmt(cells: list[str]) -> str:
+        return "| " + " | ".join(cells[i].ljust(widths[i]) for i in range(n_cols)) + " |"
+
+    out = [fmt(padded_rows[0])]
+    out.append("| " + " | ".join("-" * w for w in widths) + " |")
+    for row in padded_rows[1:]:
+        out.append(fmt(row))
+    return out
+
+
+def preprocess(md: str) -> str:
+    lines = md.split("\n")
+    out: list[str] = []
+    i = 0
+    in_fence = False
+    fence_marker = ""
+    while i < len(lines):
+        line = lines[i]
+        if in_fence:
+            out.append(line)
+            if line.lstrip().startswith(fence_marker):
+                in_fence = False
+            i += 1
+            continue
+        m = FENCE_RE.match(line)
+        if m:
+            in_fence = True
+            fence_marker = m.group(1)
+            out.append(line)
+            i += 1
+            continue
+        line = H3_RE.sub(r"######\1", line)
+        if is_table_row(line) and i + 1 < len(lines) and is_separator(lines[i + 1]):
+            header = [strip_inline(c) for c in parse_row(line)]
+            body: list[list[str]] = []
+            j = i + 2
+            while j < len(lines) and is_table_row(lines[j]) and not is_separator(lines[j]):
+                body.append([strip_inline(c) for c in parse_row(lines[j])])
+                j += 1
+            out.append("```")
+            out.extend(format_table([header] + body))
+            out.append("```")
+            i = j
+            continue
+        out.append(line)
+        i += 1
+    return "\n".join(out)
+
+
+def main() -> int:
+    root = Path(__file__).resolve().parent.parent
+    src = root / "docs" / "search.md"
+    dst = root / "docs" / "search-medium.html"
+    transformed = preprocess(src.read_text())
+    result = subprocess.run(
+        ["pandoc", "-f", "markdown", "-t", "html", "-o", str(dst), "--standalone", "--syntax-highlighting=none"],
+        input=transformed,
+        text=True,
+    )
+    return result.returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main())
