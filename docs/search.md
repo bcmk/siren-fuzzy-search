@@ -344,7 +344,9 @@ The partial index is tiny for typical nickname data.
 -- GIN produces no trigrams for nonalnum characters
 -- and can worsen timings by orders of magnitude
 set local enable_seqscan = off;
-set local enable_indexscan = off;
+-- an index-only scan is enabled
+-- only when both of these are on
+set local enable_indexscan = on;
 set local enable_indexonlyscan = on;
 set local enable_bitmapscan = off;
 
@@ -388,7 +390,9 @@ The partial index is tiny for typical nickname data and `INCLUDE` enables index-
 ```sql
 -- force index-only scan on text_pattern_ops btree
 set local enable_seqscan = off;
-set local enable_indexscan = off;
+-- an index-only scan is enabled
+-- only when both of these are on
+set local enable_indexscan = on;
 set local enable_indexonlyscan = on;
 set local enable_bitmapscan = off;
 

@@ -198,7 +198,8 @@ def search(
         if max_nonalnum_run >= 3:
             with leg_pipeline("nonalnum runs"):
                 cur.execute("set local enable_seqscan = off")
-                cur.execute("set local enable_indexscan = off")
+                # An index-only scan is enabled only when both of these are on
+                cur.execute("set local enable_indexscan = on")
                 cur.execute("set local enable_indexonlyscan = on")
                 cur.execute("set local enable_bitmapscan = off")
                 cur.execute(
@@ -223,9 +224,10 @@ def search(
         if max_alnum_run < 3 and max_nonalnum_run < 3:
             with leg_pipeline("prefix match"):
                 cur.execute("set local enable_seqscan = off")
-                cur.execute("set local enable_indexscan = off")
-                cur.execute("set local enable_bitmapscan = off")
+                # An index-only scan is enabled only when both of these are on
+                cur.execute("set local enable_indexscan = on")
                 cur.execute("set local enable_indexonlyscan = on")
+                cur.execute("set local enable_bitmapscan = off")
                 cur.execute(
                     psycopg.sql.SQL(
                         """
